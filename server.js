@@ -1,4 +1,3 @@
-
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -13,6 +12,26 @@ const io = new Server(server, {
     origin: true,
     methods: ['GET', 'POST']
   }
+});
+
+// Bugatti modeli GitHub deposunun ana klasöründe duruyor,
+// ancak index.html dosyası /models/bugatti-chiron.glb yolunu istiyor.
+// Bu rota, mevcut dosyayı oyunun beklediği adresten sunar.
+app.get('/models/bugatti-chiron.glb', (req, res) => {
+  const bugattiPath = path.join(__dirname, 'bugatti-chiron.glb');
+
+  if (!fs.existsSync(bugattiPath)) {
+    console.error('Bugatti GLB dosyası bulunamadı:', bugattiPath);
+    return res.status(404).send('Bugatti 3D model dosyası sunucuda bulunamadı.');
+  }
+
+  res.type('model/gltf-binary');
+  res.sendFile(bugattiPath, err => {
+    if (err) {
+      console.error('Bugatti GLB gönderilemedi:', err);
+      if (!res.headersSent) res.status(500).send('Bugatti modeli gönderilemedi.');
+    }
+  });
 });
 
 // Ana klasördeki dosyaları yayınla
@@ -66,7 +85,6 @@ io.on('connection', socket => {
   // Oda oluştur
   socket.on('create-room', () => {
     const code = makeCode();
-
     rooms.set(code, new Map([
       [socket.id, {
         id: socket.id,
@@ -90,7 +108,6 @@ io.on('connection', socket => {
   // Odaya katıl
   socket.on('join-room', raw => {
     const code = String(raw || '').replace(/\D/g, '');
-
     if (!/^\d{6}$/.test(code)) {
       socket.emit('room-error', 'Oda kodu 6 rakam olmalı.');
       return;
@@ -109,7 +126,6 @@ io.on('connection', socket => {
     }
 
     const players = [...room.values()];
-
     const player = {
       id: socket.id,
       x: 0,
@@ -138,7 +154,6 @@ io.on('connection', socket => {
     const code = socket.data.room;
 
     if (!code || !rooms.has(code)) return;
-
     raceWinners.delete(code);
     io.to(code).emit('race-start');
   });
