@@ -1,3 +1,4 @@
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -14,50 +15,37 @@ const io = new Server(server, {
   }
 });
 
-// Bugatti modeli GitHub deposunun ana klasöründe duruyor,
-// ancak index.html dosyası /models/bugatti-chiron.glb yolunu istiyor.
-// Bu rota, mevcut dosyayı oyunun beklediği adresten sunar.
+// Bugatti 3D modeli
 app.get('/models/bugatti-chiron.glb', (req, res) => {
   const bugattiPath = path.join(__dirname, 'bugatti-chiron.glb');
 
   if (!fs.existsSync(bugattiPath)) {
-    console.error('Bugatti GLB dosyası bulunamadı:', bugattiPath);
-    return res.status(404).send('Bugatti 3D model dosyası sunucuda bulunamadı.');
+    console.error('Bugatti GLB bulunamadı:', bugattiPath);
+    return res.status(404).send('Bugatti modeli bulunamadı.');
   }
 
   res.type('model/gltf-binary');
-  res.sendFile(bugattiPath, err => {
-    if (err) {
-      console.error('Bugatti GLB gönderilemedi:', err);
-      if (!res.headersSent) res.status(500).send('Bugatti modeli gönderilemedi.');
-    }
-  });
+  res.sendFile(bugattiPath);
 });
 
-// Ana klasördeki dosyaları yayınla
+// Dosyaları yayınla
 app.use(express.static(__dirname));
-
-// Varsa public klasörünü de yayınla
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Ana sayfa
 app.get('/', (req, res) => {
   const indexPath = path.join(__dirname, 'index.html');
 
   if (!fs.existsSync(indexPath)) {
-    console.error('index.html bulunamadı:', indexPath);
-    return res.status(404).send('index.html dosyası bulunamadı.');
+    return res.status(404).send('index.html bulunamadı.');
   }
 
   res.sendFile(indexPath);
 });
 
-// Index dosyasına doğrudan erişim
 app.get('/index.html', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// Sağlık kontrolü
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
@@ -67,6 +55,7 @@ app.get('/health', (req, res) => {
 
 const rooms = new Map();
 const raceWinners = new Map();
+const pendingRoomTravels = new Map();
 
 function makeCode() {
   let c;
@@ -80,11 +69,63 @@ function makeCode() {
   return c;
 }
 
+// Geçiş oylamasını bitir
+function finishRoomTravel(code, approved, reason) {
+  const pending = pendingRoomTravels.get(code);
+  if (!pending) return;
+
+  clearTimeout(pending.timeout);
+  pendingRoomTravels.delete(code);
+
+  if (approved) {
+    io.to(code).emit('room-travel-approved', {
+      requestId: pending.requestId,
+      destination: pending.destination
+    });
+  } else {
+    io.to(code).emit('room-travel-rejected', {
+      requestId: pending.requestId,
+      destination: pending.destination,
+      reason: reason || 'Oylama kabul edilmedi.'
+    });
+  }
+}
+
+// Oylama durumunu güncelle
+function updateRoomTravelVote(code) {
+  const pending = pendingRoomTravels.get(code);
+  const room = rooms.get(code);
+
+  if (!pending || !room) return;
+
+  const total = room.size;
+  const yes = pending.yes.size;
+  const no = pending.no.size;
+
+  io.to(code).emit('room-travel-vote-update', {
+    requestId: pending.requestId,
+    yes,
+    no,
+    total
+  });
+
+  if (no > 0) {
+    finishRoomTravel(
+      code,
+      false,
+      'Bir oyuncu geçişi reddetti.'
+    );
+  } else if (yes >= total) {
+    finishRoomTravel(code, true);
+  }
+}
+
 io.on('connection', socket => {
 
   // Oda oluştur
   socket.on('create-room', () => {
     const code = makeCode();
+
     rooms.set(code, new Map([
       [socket.id, {
         id: socket.id,
@@ -108,6 +149,7 @@ io.on('connection', socket => {
   // Odaya katıl
   socket.on('join-room', raw => {
     const code = String(raw || '').replace(/\D/g, '');
+
     if (!/^\d{6}$/.test(code)) {
       socket.emit('room-error', 'Oda kodu 6 rakam olmalı.');
       return;
@@ -126,6 +168,7 @@ io.on('connection', socket => {
     }
 
     const players = [...room.values()];
+
     const player = {
       id: socket.id,
       x: 0,
@@ -147,6 +190,123 @@ io.on('connection', socket => {
     });
 
     socket.to(code).emit('player-joined', player);
+
+    if (pendingRoomTravels.has(code)) {
+      updateRoomTravelVote(code);
+    }
+  });
+
+  // Backrooms ve diğer alanlara geçiş isteği
+  socket.on('request-room-travel', (data, ack) => {
+    const code = socket.data.room;
+    const room = code && rooms.get(code);
+
+    const destination = String(
+      data?.destination || ''
+    );
+
+    if (!room || !room.has(socket.id)) {
+      if (typeof ack === 'function') {
+        ack({
+          ok: false,
+          error: 'Oda bulunamadı.'
+        });
+      }
+      return;
+    }
+
+    if (![
+      'backrooms',
+      'city',
+      'race',
+      'parking'
+    ].includes(destination)) {
+      if (typeof ack === 'function') {
+        ack({
+          ok: false,
+          error: 'Geçersiz geçiş hedefi.'
+        });
+      }
+      return;
+    }
+
+    if (pendingRoomTravels.has(code)) {
+      if (typeof ack === 'function') {
+        ack({
+          ok: false,
+          error: 'Bu odada zaten bir geçiş oylaması var.'
+        });
+      }
+      return;
+    }
+
+    const requestId = `${Date.now()}-${socket.id}`;
+
+    const pending = {
+      requestId,
+      destination,
+      requesterId: socket.id,
+      yes: new Set([socket.id]),
+      no: new Set(),
+      timeout: null
+    };
+
+    pending.timeout = setTimeout(() => {
+      finishRoomTravel(
+        code,
+        false,
+        'Geçiş oylamasının süresi doldu.'
+      );
+    }, 30000);
+
+    pendingRoomTravels.set(code, pending);
+
+    if (typeof ack === 'function') {
+      ack({
+        ok: true,
+        requestId
+      });
+    }
+
+    socket.to(code).emit('room-travel-request', {
+      requestId,
+      id: requestId,
+      destination,
+      name: String(
+        data?.name || 'Bir oyuncu'
+      ).slice(0, 32),
+      from: socket.id
+    });
+
+    updateRoomTravelVote(code);
+  });
+
+  // Oyuncunun oyunu
+  socket.on('vote-room-travel', data => {
+    const code = socket.data.room;
+    const room = code && rooms.get(code);
+    const pending = code && pendingRoomTravels.get(code);
+
+    if (!room || !pending || !room.has(socket.id)) return;
+
+    if (
+      String(data?.requestId || '') !== pending.requestId
+    ) return;
+
+    if (socket.id === pending.requesterId) return;
+
+    if (
+      pending.yes.has(socket.id) ||
+      pending.no.has(socket.id)
+    ) return;
+
+    if (data?.yes === true) {
+      pending.yes.add(socket.id);
+    } else {
+      pending.no.add(socket.id);
+    }
+
+    updateRoomTravelVote(code);
   });
 
   // Yarışı başlat
@@ -154,6 +314,7 @@ io.on('connection', socket => {
     const code = socket.data.room;
 
     if (!code || !rooms.has(code)) return;
+
     raceWinners.delete(code);
     io.to(code).emit('race-start');
   });
@@ -169,7 +330,9 @@ io.on('connection', socket => {
 
     io.to(code).emit('race-winner', {
       id: socket.id,
-      name: String(data?.name || 'Bir oyuncu').slice(0, 32),
+      name: String(
+        data?.name || 'Bir oyuncu'
+      ).slice(0, 32),
       reward: 500
     });
   });
@@ -210,6 +373,20 @@ io.on('connection', socket => {
     if (!code || !rooms.has(code)) return;
 
     const room = rooms.get(code);
+    const pending = pendingRoomTravels.get(code);
+
+    if (pending) {
+      if (pending.requesterId === socket.id) {
+        finishRoomTravel(
+          code,
+          false,
+          'İsteği gönderen oyuncu odadan ayrıldı.'
+        );
+      } else {
+        pending.yes.delete(socket.id);
+        pending.no.delete(socket.id);
+      }
+    }
 
     room.delete(socket.id);
 
@@ -218,6 +395,15 @@ io.on('connection', socket => {
     if (room.size === 0) {
       rooms.delete(code);
       raceWinners.delete(code);
+
+      const remaining = pendingRoomTravels.get(code);
+
+      if (remaining) {
+        clearTimeout(remaining.timeout);
+        pendingRoomTravels.delete(code);
+      }
+    } else if (pendingRoomTravels.has(code)) {
+      updateRoomTravelVote(code);
     }
   });
 });
